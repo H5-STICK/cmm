@@ -1,0 +1,137 @@
+
+name: Renovar CMM IPTV
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: renovar-cmm
+  cancel-in-progress: false
+
+jobs:
+  renovar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Obtener manifiesto actualizado
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import urllib.request
+          import urllib.parse
+          import json
+          import base64
+          import time
+          from pathlib import Path
+
+          origen = (
+              "https://cdnapisec.kaltura.com/"
+              "p/2288691/sp/228869100/"
+              "playManifest/entryId/1_gnz6ity9/"
+              "protocol/https/format/applehttp/a.m3u8"
+          )
+
+          req = urllib.request.Request(
+              origen,
+              headers={"User-Agent": "Mozilla/5.0"}
+          )
+
+          with urllib.request.urlopen(req, timeout=30) as r:
+              contenido = r.read().decode("utf-8-sig")
+              base = r.url
+
+          lineas = contenido.splitlines()
+          if not lineas or lineas[0].strip() != "#EXTM3U":
+              raise RuntimeError("Respuesta HLS no valida")
+
+          resultado = []
+          variantes = []
+          caducidades = []
+
+          for linea in lineas:
+              linea = linea.strip()
+
+              if not linea:
+                  continue
+
+              if linea.startswith("#"):
+                  resultado.append(linea)
+                  continue
+
+              absoluta = urllib.parse.urljoin(base, linea)
+              variantes.append(absoluta)
+              resultado.append(absoluta)
+
+              params = urllib.parse.parse_qs(
+                  urllib.parse.urlsplit(absoluta).query
+              )
+
+              if "Policy" not in params:
+                  raise RuntimeError("Falta Policy")
+
+              policy = params["Policy"][0]
+              policy += "=" * (-len(policy) % 4)
+
+              datos = json.loads(
+                  base64.urlsafe_b64decode(policy)
+              )
+
+              exp = int(
+                  datos["Statement"][0]
+                  ["Condition"]["DateLessThan"]
+                  ["AWS:EpochTime"]
+              )
+              caducidades.append(exp)
+
+              if "Signature" not in params:
+                  raise RuntimeError("Falta Signature")
+
+              if "Key-Pair-Id" not in params:
+                  raise RuntimeError("Falta Key-Pair-Id")
+
+          if len(variantes) != 4:
+              raise RuntimeError(
+                  f"Se esperaban 4 variantes: {len(variantes)}"
+              )
+
+          if min(caducidades) < time.time() + 900:
+              raise RuntimeError(
+                  "Firmas con menos de 15 minutos de validez"
+              )
+
+          destino = Path("cmm.m3u8")
+          destino.write_text(
+              "\n".join(resultado) + "\n",
+              encoding="utf-8"
+          )
+
+          print("Variantes:", len(variantes))
+          print("Caducidad UTC:",
+                time.strftime(
+                    "%Y-%m-%d %H:%M:%S",
+                    time.gmtime(min(caducidades))
+                ))
+          print("Manifiesto actualizado")
+          PY
+
+      - name: Publicar cambios
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cmm.m3u8
+          if git diff --cached --quiet; then
+            echo "Sin cambios"
+          else
+            git commit -m "Renovar enlaces CMM"
+            git push
+          fi
